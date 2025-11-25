@@ -1,21 +1,39 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import torch.utils.model_zoo as model_zoo
-import torch.nn.functional as F
 
-resnet50_url = 'https://download.pytorch.org/models/resnet50-19c8e357.pth',
+###############################################
+# ★ 추가 블록: SE Attention Block
+###############################################
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
 
 
+#################################################
+# Basic Residual Blocks
+#################################################
 def conv3x3(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
                      padding=1, bias=False)
 
 
 class BasicBlock(nn.Module):
     expansion = 1
-
     def __init__(self, in_planes, planes, stride=1, downsample=None):
         super(BasicBlock, self).__init__()
         self.conv1 = conv3x3(in_planes, planes, stride)
@@ -28,7 +46,6 @@ class BasicBlock(nn.Module):
 
     def forward(self, x):
         residual = x
-
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
@@ -38,16 +55,13 @@ class BasicBlock(nn.Module):
 
         if self.downsample is not None:
             residual = self.downsample(x)
-
         out += residual
         out = self.relu(out)
-
         return out
 
 
 class Bottleneck(nn.Module):
     expansion = 4
-
     def __init__(self, in_planes, planes, stride=1, downsample=None):
         super(Bottleneck, self).__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
@@ -63,7 +77,6 @@ class Bottleneck(nn.Module):
 
     def forward(self, x):
         residual = x
-
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
@@ -74,27 +87,24 @@ class Bottleneck(nn.Module):
 
         out = self.conv3(out)
         out = self.bn3(out)
-
         if self.downsample is not None:
             residual = self.downsample(x)
-
         out += residual
         out = self.relu(out)
-
         return out
 
 
+#################################################
+# DetNet (Detection-Friendly Backbone Block)
+#################################################
 class DetNet(nn.Module):
-    # no expansion
-    # dilation = 2
-    # type B use 1x1 conv
     expansion = 1
-
     def __init__(self, in_planes, planes, stride=1, block_type='A'):
         super(DetNet, self).__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=2, bias=False, dilation=2)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=2, bias=False, dilation=2)
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv3 = nn.Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(self.expansion * planes)
@@ -115,27 +125,43 @@ class DetNet(nn.Module):
         return out
 
 
+#################################################
+# Full Network (Backbone + Detection Head)
+#################################################
 class ResNet(nn.Module):
 
     def __init__(self, block, layers, num_classes=1000):
-        self.in_planes = 64
         super(ResNet, self).__init__()
+        self.in_planes = 64
+
+        # -------- backbone front ----------
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
-
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(block, 64, layers[0])
+        # -------- ResNet Backbone ----------
+        self.layer1 = self._make_layer(block, 64,  layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-        # self.layer5 = self._make_layer(block, 512, layers[3], stride=2)
+
+        # -------- ★ 추가: SE Attention --------
+        self.se4 = SEBlock(2048)   # channel after layer4
+
+        # -------- DetNet block ----------
         self.layer5 = self._make_detnet_layer(in_channels=2048)
-        # self.avgpool = nn.AvgPool2d(14) #fit 448 input size
-        # self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+        # -------- ★ Detection Head 강화 (추가) --------
+        self.head_conv1 = nn.Conv2d(256, 256, 3, padding=1)
+        self.head_bn1 = nn.BatchNorm2d(256)
+        self.head_act1 = nn.LeakyReLU(0.1)
+
+        # -------- YOLOv1 Detection Head --------
         self.conv_end = nn.Conv2d(256, 30, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn_end = nn.BatchNorm2d(30)
+
+        # weight init
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
@@ -144,21 +170,25 @@ class ResNet(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
+
+    #################################################
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
         if stride != 1 or self.in_planes != planes * block.expansion:
             downsample = nn.Sequential(
-                nn.Conv2d(self.in_planes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.Conv2d(self.in_planes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(planes * block.expansion),
             )
-        #[3, 4, 6, 3]
+
         layers = [block(self.in_planes, planes, stride, downsample)]
         self.in_planes = planes * block.expansion
-        for i in range(1, blocks):
+        for _ in range(1, blocks):
             layers.append(block(self.in_planes, planes))
-
         return nn.Sequential(*layers)
 
+
+    #################################################
     def _make_detnet_layer(self, in_channels):
         layers = [
             DetNet(in_planes=in_channels, planes=256, block_type='B'),
@@ -167,7 +197,12 @@ class ResNet(nn.Module):
         ]
         return nn.Sequential(*layers)
 
+
+    #################################################
+    # forward pass
+    #################################################
     def forward(self, x):
+
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -177,28 +212,39 @@ class ResNet(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
+
+        # ★ SE Attention 적용
+        x = self.se4(x)
+
         x = self.layer5(x)
-        # x = self.avgpool(x)
-        # x = x.view(x.size(0), -1)
-        # x = self.fc(x)
+
+        # ★ Detection Head 강화
+        x = self.head_conv1(x)
+        x = self.head_bn1(x)
+        x = self.head_act1(x)
+
+        # YOLOv1 Head
         x = self.conv_end(x)
         x = self.bn_end(x)
-        x = torch.sigmoid(x)
-        # x = x.view(-1,14,14,30)
-        x = x.permute(0, 2, 3, 1)  # (-1,14,14,30)
 
+        x = torch.sigmoid(x)
+        x = x.permute(0, 2, 3, 1)  # → (batch, 14, 14, 30)
         return x
 
 
-# resnet50
+#################################################
+# build resnet50 model
+#################################################
 def resnet50(pretrained=False, **kwargs):
-    model_ = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
+    model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        model_.load_state_dict(model_zoo.load_url('https://download.pytorch.org/models/resnet50-19c8e357.pth'))
-    return model_
+        model.load_state_dict(model_zoo.load_url(
+            'https://download.pytorch.org/models/resnet50-19c8e357.pth'))
+    return model
 
 
-if __name__ == '__main__':
-    a = torch.randn((2, 3, 448, 448))
+if __name__ == "__main__":
+    x = torch.randn((2, 3, 448, 448))
     model = resnet50()
-    print(model(a).shape)
+    out = model(x)
+    print(out.shape)
