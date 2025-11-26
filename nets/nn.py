@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet50
 
 
 # ---------------------------
@@ -14,22 +14,22 @@ class SPP(nn.Module):
         self.pool2 = nn.MaxPool2d(kernel_size=9, stride=1, padding=4)
         self.pool3 = nn.MaxPool2d(kernel_size=13, stride=1, padding=6)
 
-        # 채널을 줄여주기 위한 1x1 conv
+        # 채널 축소 → 안전하게 512로 고정
         self.reduce = nn.Conv2d(in_channels, 512, kernel_size=1)
 
     def forward(self, x):
-        x = self.reduce(x)  # → (batch, 512, H, W)
+        x = self.reduce(x)
 
         p1 = self.pool1(x)
         p2 = self.pool2(x)
         p3 = self.pool3(x)
 
-        # concat → (512*4 = 2048 channels)
+        # concat 결과: 512 * 4 = 2048
         return torch.cat([x, p1, p2, p3], dim=1)
 
 
 # ---------------------------
-# YOLO Detection Head
+# YOLO Head
 # ---------------------------
 class YOLOHead(nn.Module):
     def __init__(self):
@@ -47,25 +47,26 @@ class YOLOHead(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.conv3(x)
 
-        # YOLO는 14x14로 맞춰야 함
+        # YOLO는 14x14 고정
         x = F.adaptive_avg_pool2d(x, (14, 14))
 
-        return x.permute(0, 2, 3, 1)
+        return x.permute(0, 2, 3, 1)  # (B, H, W, 30)
 
 
 # ---------------------------
-# Backbone (ResNet50)
+# ResNet Backbone
 # ---------------------------
 class ResNetBackbone(nn.Module):
     def __init__(self):
         super().__init__()
-        # pretrained resnet
-        net = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
 
-        # small object 개선: conv1 stride 2 → 1
+        # 네 환경에서는 pretrained=True 로 불러야 함
+        net = resnet50(pretrained=True)
+
+        # stride=1로 변경 (small object 개선)
         net.conv1.stride = (1, 1)
 
-        # layer4 output 채널 2048
+        # ResNet50 기본 구조
         self.backbone = nn.Sequential(
             net.conv1,
             net.bn1,
@@ -77,7 +78,7 @@ class ResNetBackbone(nn.Module):
             net.layer4,
         )
 
-        # SPP 추가
+        # SPP
         self.spp = SPP(in_channels=2048)
 
     def forward(self, x):
@@ -87,7 +88,7 @@ class ResNetBackbone(nn.Module):
 
 
 # ---------------------------
-# Full YOLOv1 model
+# Full YOLO Model
 # ---------------------------
 class resnet50_yolo(nn.Module):
     def __init__(self):
@@ -101,5 +102,6 @@ class resnet50_yolo(nn.Module):
         return x
 
 
+# main.py에서 import 하는 함수 이름
 def resnet50():
     return resnet50_yolo()
