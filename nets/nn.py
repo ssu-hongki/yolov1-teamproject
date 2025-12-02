@@ -8,7 +8,7 @@ resnet50_url = "https://download.pytorch.org/models/resnet50-19c8e357.pth"
 
 
 ##############################################
-# 3x3 Conv helper
+# 3×3 Conv helper
 ##############################################
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(
@@ -36,7 +36,6 @@ class BasicBlock(nn.Module):
 
     def forward(self, x):
         idt = x
-
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
 
@@ -82,7 +81,7 @@ class Bottleneck(nn.Module):
 
 
 ##############################################
-# DetNet block (dilated C5)
+# DetNet (C5 유지)
 ##############################################
 class DetNet(nn.Module):
     expansion = 1
@@ -94,9 +93,8 @@ class DetNet(nn.Module):
 
         self.conv2 = nn.Conv2d(
             planes, planes,
-            kernel_size=3, stride=stride,
-            dilation=2, padding=2,
-            bias=False
+            3, stride=stride,
+            padding=2, dilation=2, bias=False
         )
         self.bn2 = nn.BatchNorm2d(planes)
 
@@ -115,12 +113,11 @@ class DetNet(nn.Module):
         out = F.relu(self.bn1(self.conv1(x)))
         out = F.relu(self.bn2(self.conv2(out)))
         out = self.bn3(self.conv3(out))
-        out = out + self.downsample(x)
-        return F.relu(out)
+        return F.relu(out + self.downsample(x))
 
 
 ##############################################
-# Main Model: ResNet + DetNet + fusion + head
+# Full FPN + Head
 ##############################################
 class ResNet(nn.Module):
     def __init__(self, block, layers):
@@ -129,62 +126,55 @@ class ResNet(nn.Module):
 
         # Stem
         self.conv1 = nn.Conv2d(
-            3, 64, kernel_size=7, stride=2, padding=3, bias=False
+            3, 64, 7, stride=2, padding=3, bias=False
         )
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(3, 2, 1)
 
         # Backbone
-        self.layer1 = self._make_layer(block, 64, layers[0])        # 112 → 112
-        self.layer2 = self._make_layer(block, 128, layers[1], 2)    # 112 → 56
-        self.layer3 = self._make_layer(block, 256, layers[2], 2)    # 56 → 28
-        self.layer4 = self._make_layer(block, 512, layers[3], 2)    # 28 → 14
+        self.layer1 = self._make_layer(block, 64, layers[0])      
+        self.layer2 = self._make_layer(block, 128, layers[1], 2)
+        self.layer3 = self._make_layer(block, 256, layers[2], 2)  
+        self.layer4 = self._make_layer(block, 512, layers[3], 2)
 
-        # DetNet C5 유지
-        self.layer5 = self._make_detnet_layer(2048)                # 14×14 → 256ch
+        # DetNet C5
+        self.layer5 = self._make_detnet_layer(2048)
 
-        # -------- Fusion 개선 (C3 + DetNet C5) --------
-        self.fuse_reduce = nn.Conv2d(1024, 256, kernel_size=1, bias=False)
-        self.fuse_bn = nn.BatchNorm2d(256)
+        # -----------------------------
+        # FPN FULL
+        # -----------------------------
+        # reduce channels for P3/P4/P5
+        self.c3_reduce = nn.Conv2d(1024, 256, 1, bias=False)
+        self.c4_reduce = nn.Conv2d(2048, 256, 1, bias=False)
+        self.c5_reduce = nn.Conv2d(256, 256, 1, bias=False)
 
-        # stride=2 conv downsample (더 좋음)
-        self.fuse_down = nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1)
+        # smoothing after add
+        self.smooth3 = nn.Conv2d(256, 256, 3, padding=1)
+        self.smooth4 = nn.Conv2d(256, 256, 3, padding=1)
+        self.smooth5 = nn.Conv2d(256, 256, 3, padding=1)
 
-        # concat 후 feature alignment conv
-        self.fuse_align = nn.Conv2d(512, 512, 3, padding=1, bias=False)
-        self.fuse_align_bn = nn.BatchNorm2d(512)
+        # downsample P3 → 14×14
+        self.p3_down = nn.Conv2d(256, 256, 3, stride=2, padding=1)
 
-        # -------- 개선된 Detection Head --------
-        self.head_conv1 = nn.Conv2d(512, 512, 3, padding=1, bias=False)
+        # -----------------------------
+        # Detection Head
+        # -----------------------------
+        self.head_conv1 = nn.Conv2d(512, 512, 3, padding=1)
         self.head_bn1 = nn.BatchNorm2d(512)
 
-        self.head_conv2 = nn.Conv2d(512, 256, 3, padding=1, bias=False)
+        self.head_conv2 = nn.Conv2d(512, 256, 3, padding=1)
         self.head_bn2 = nn.BatchNorm2d(256)
 
-        # 추가: 256 → 256 conv
-        self.head_conv3 = nn.Conv2d(256, 256, 3, padding=1, bias=False)
+        self.head_dil = nn.Conv2d(256, 256, 3, padding=2, dilation=2)
         self.head_bn3 = nn.BatchNorm2d(256)
 
-        # 추가: dilated conv
-        self.head_dilated = nn.Conv2d(256, 256, 3, padding=2, dilation=2, bias=False)
-        self.head_bn_dil = nn.BatchNorm2d(256)
-
-        # final head
-        self.conv_end = nn.Conv2d(256, 30, kernel_size=1, bias=False)
+        self.conv_end = nn.Conv2d(256, 30, 1)
         self.bn_end = nn.BatchNorm2d(30)
 
-        # Init
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-
-    ##############################################
-    # ResNet layer maker
-    ##############################################
+    ##################################
+    # Layer builder
+    ##################################
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
 
@@ -192,9 +182,9 @@ class ResNet(nn.Module):
             downsample = nn.Sequential(
                 nn.Conv2d(
                     self.in_planes, planes * block.expansion,
-                    kernel_size=1, stride=stride, bias=False
+                    1, stride=stride, bias=False
                 ),
-                nn.BatchNorm2d(planes * block.expansion),
+                nn.BatchNorm2d(planes * block.expansion)
             )
 
         layers = [
@@ -207,56 +197,59 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    ##############################################
+    ##################################
     # DetNet
-    ##############################################
+    ##################################
     def _make_detnet_layer(self, in_channels):
         return nn.Sequential(
             DetNet(in_channels, 256, block_type="B"),
             DetNet(256, 256, block_type="A"),
-            DetNet(256, 256, block_type="A"),
+            DetNet(256, 256, block_type="A")
         )
 
-    ##############################################
+    ##################################
     # Forward
-    ##############################################
+    ##################################
     def forward(self, x):
-        # ---- stem ----
+        # Stem
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
 
-        # ---- backbone ----
-        x = self.layer1(x)
-        x = self.layer2(x)
-        c3 = self.layer3(x)  # 28×28, 1024ch
-        x = self.layer4(c3)  # 14×14, 2048ch
+        # Backbone
+        c3 = self.layer3(self.layer2(self.layer1(x)))   # 28×28, 1024ch
+        c4 = self.layer4(c3)                            # 14×14, 2048ch
+        c5 = self.layer5(c4)                            # 14×14, 256ch
 
-        # ---- DetNet C5 ----
-        c5 = self.layer5(x)  # (B,256,14,14)
+        # FPN
+        p5 = self.smooth5(self.c5_reduce(c5))
 
-        # ---- Fusion ----
-        p3 = F.relu(self.fuse_bn(self.fuse_reduce(c3)))
-        p3 = self.fuse_down(p3)  # 28→14
+        p4 = self.c4_reduce(c4) + F.interpolate(p5, size=c4.shape[-2:], mode='nearest')
+        p4 = self.smooth4(p4)
 
-        x = torch.cat([c5, p3], dim=1)  # (B,512,14,14)
-        x = F.relu(self.fuse_align_bn(self.fuse_align(x)))
+        p3 = self.c3_reduce(c3) + F.interpolate(p4, size=c3.shape[-2:], mode='nearest')
+        p3 = self.smooth3(p3)
 
-        # ---- Detection head ----
-        x = F.relu(self.head_bn1(self.head_conv1(x)))
-        x = F.relu(self.head_bn2(self.head_conv2(x)))
-        x = F.relu(self.head_bn3(self.head_conv3(x)))
-        x = F.relu(self.head_bn_dil(self.head_dilated(x)))
+        # P3 → 14×14
+        p3_down = self.p3_down(p3)
 
-        x = torch.sigmoid(self.bn_end(self.conv_end(x)))
+        # concat P5 + p3_down
+        out = torch.cat([p5, p3_down], dim=1)  # (B, 512, 14, 14)
 
-        return x.permute(0, 2, 3, 1)
+        # HEAD
+        out = F.relu(self.head_bn1(self.head_conv1(out)))
+        out = F.relu(self.head_bn2(self.head_conv2(out)))
+        out = F.relu(self.head_bn3(self.head_dil(out)))
+
+        out = torch.sigmoid(self.bn_end(self.conv_end(out)))
+
+        return out.permute(0, 2, 3, 1)
 
 
 ##############################################
-# model factory
+# resnet50 entry
 ##############################################
-def resnet50(pretrained=False, **kwargs):
-    model = ResNet(Bottleneck, [3, 4, 6, 3])
+def resnet50(pretrained=True, **kwargs):
+    model = ResNet(Bottleneck, [3,4,6,3])
 
     if pretrained:
         state_dict = model_zoo.load_url(resnet50_url)
@@ -266,12 +259,6 @@ def resnet50(pretrained=False, **kwargs):
             if k in model_dict and not k.startswith("fc"):
                 model_dict[k] = v
 
-        model.load_state_dict(model_dict)
+        model.load_state_dict(model_dict, strict=False)
 
     return model
-
-
-if __name__ == "__main__":
-    m = resnet50()
-    a = torch.randn(1, 3, 448, 448)
-    print(m(a).shape)

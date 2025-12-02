@@ -19,151 +19,102 @@ def main(args):
     root = args.data_dir
     num_epochs = args.epoch
     batch_size = args.batch_size
-    learning_rate = args.lr
+    lr = args.lr
 
     seed = 42
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # -----------------------------------------
-    # 1) 모델 생성
-    # -----------------------------------------
-    net = resnet50(pretrained=False)
-    net = net.to(device)
+    # -------------------------
+    # MODEL (with pretrained=True)
+    # -------------------------
+    net = resnet50(pretrained=True).to(device)
 
-    # -----------------------------------------
-    # 2) pretrained weight 가져오기 여부
-    # -----------------------------------------
+    # pretrained checkpoint (optional)
     if args.pre_weights is not None:
-        pattern = 'yolov1_([0-9]+)'
-        strs = args.pre_weights.split('.')[-2]
-        f_name = strs.split('/')[-1]
-        epoch_str = re.search(pattern, f_name).group(1)
-        epoch_start = int(epoch_str) + 1
-
-        print(f"Loading pretrained checkpoint: epoch {epoch_str}")
-        net.load_state_dict(torch.load(f'./weights/{args.pre_weights}')['state_dict'])
-
+        ckpt = torch.load(f'./weights/{args.pre_weights}')
+        net.load_state_dict(ckpt['state_dict'], strict=False)
+        epoch_start = int(args.pre_weights.split('_')[1].split('.')[0]) + 1
     else:
         epoch_start = 1
-        print("Training from scratch (no pretrained ResNet50 loaded).")
-
 
     if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs (DataParallel).")
         net = torch.nn.DataParallel(net)
 
-
-    # -----------------------------------------
-    # 3) Loss & Optimizer
-    # -----------------------------------------
+    # LOSS
     criterion = yoloLoss().to(device)
 
+    # OPTIMIZER
     optimizer = torch.optim.SGD(
         net.parameters(),
-        lr=learning_rate,
+        lr=lr,
         momentum=0.9,
         weight_decay=5e-4
     )
 
-    # -----------------------------------------
-    # 4) Dataset
-    # -----------------------------------------
+    # DATASET
     with open('./Dataset/train.txt') as f:
         train_names = f.readlines()
     train_dataset = Dataset(root, train_names, train=True, transform=[transforms.ToTensor()])
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=os.cpu_count()
-    )
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     with open('./Dataset/test.txt') as f:
         test_names = f.readlines()
     test_dataset = Dataset(root, test_names, train=False, transform=[transforms.ToTensor()])
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=batch_size//2, shuffle=False,
-        num_workers=os.cpu_count()
-    )
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size//2, shuffle=False)
 
-    print(f"NUMBER OF DATA SAMPLES: {len(train_dataset)}")
-    print(f"BATCH SIZE: {batch_size}")
-
-
-    # -----------------------------------------
-    # 5) Training loop
-    # -----------------------------------------
+    # -------------------------
+    # TRAINING
+    # -------------------------
     for epoch in range(epoch_start, num_epochs):
 
         net.train()
+        total_loss = 0
 
-        if epoch == 30:
-            learning_rate = 1e-4
-        if epoch == 40:
-            learning_rate = 1e-5
+        # lr schedule
+        if epoch == 30: lr = 1e-4
+        if epoch == 40: lr = 1e-5
+        for g in optimizer.param_groups: g['lr'] = lr
 
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = learning_rate
-
-        total_loss = 0.
-        print(('\n' + '%10s' * 3) % ('epoch', 'loss', 'gpu'))
-
-        progress_bar = tqdm.tqdm(enumerate(train_loader), total=len(train_loader))
-
-        for i, (images, target) in progress_bar:
-            images = images.to(device)
-            target = target.to(device)
+        pbar = tqdm.tqdm(train_loader)
+        for images, target in pbar:
+            images, target = images.to(device), target.to(device)
 
             pred = net(images)
+            loss = criterion(pred, target.float())
 
             optimizer.zero_grad()
-            loss = criterion(pred, target.float())
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
+            pbar.set_description(f"Epoch {epoch} Loss {total_loss/len(pbar):.4f}")
 
-            mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)
-            s = ('%10s' + '%10.4g' + '%10s') % ('%g/%g' % (epoch, num_epochs), total_loss / (i+1), mem)
-
-            progress_bar.set_description(s)
-
-        # -----------------------------------------
-        # Validation
-        # -----------------------------------------
+        # -------------------------
+        # VALIDATION
+        # -------------------------
         net.eval()
-        validation_loss = 0.0
-
+        val_loss = 0
         with torch.no_grad():
-            progress_bar = tqdm.tqdm(enumerate(test_loader), total=len(test_loader))
-            for i, (images, target) in progress_bar:
-                images = images.to(device)
-                target = target.to(device)
+            for images, target in test_loader:
+                images, target = images.to(device), target.to(device)
+                loss = criterion(net(images), target)
+                val_loss += loss.item()
 
-                prediction = net(images)
-                loss = criterion(prediction, target)
-                validation_loss += loss.item()
+        print(f"VAL LOSS = {val_loss / len(test_loader):.4f}")
 
-        validation_loss /= len(test_loader)
-        print(f"Validation_Loss: {validation_loss:07.3}")
+        if epoch % 5 == 0:
+            torch.save({'state_dict': net.state_dict()}, f'./weights/yolov1_{epoch:04d}.pth')
 
-        if (epoch % 10) == 0:
-            save = {'state_dict': net.state_dict()}
-            torch.save(save, f'./weights/yolov1_{epoch:04d}.pth')
-
-    save = {'state_dict': net.state_dict()}
-    torch.save(save, './weights/yolov1_final.pth')
+    torch.save({'state_dict': net.state_dict()}, './weights/yolov1_final.pth')
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epoch", type=int, default=30)
+    parser.add_argument("--epoch", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--data_dir", type=str, default='./Dataset')
-    parser.add_argument("--pre_weights", type=str, help="pretrained weight")
-    parser.add_argument("--save_dir", type=str, default="./weights")
-    parser.add_argument("--img_size", type=int, default=448)
+    parser.add_argument("--data_dir", type=str, default="./Dataset")
+    parser.add_argument("--pre_weights", type=str)
     args = parser.parse_args()
-
     main(args)
