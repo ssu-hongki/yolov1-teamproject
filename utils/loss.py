@@ -1,114 +1,180 @@
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
-from torch.nn import *
 
 
-class yoloLoss(Module):
+class yoloLoss(nn.Module):
     def __init__(self, num_class=20):
         super(yoloLoss, self).__init__()
-        self.lambda_coord = 5
+        self.lambda_coord = 4
         self.lambda_noobj = 0.5
         self.S = 14
         self.B = 2
         self.C = num_class
         self.step = 1.0 / 14
 
+    # -----------------------------
+    # (1) x,y,w,h → x1,y1,x2,y2 로 변환
+    # -----------------------------
+    def xywh_to_xyxy(self, box, index):
+        """
+        box: (N,4)
+        index: (i,j)
+        """
+        i, j = index
+        x = (box[:, 0] + i) * self.step
+        y = (box[:, 1] + j) * self.step
+        w = box[:, 2]
+        h = box[:, 3]
+
+        x1 = x - w / 2
+        y1 = y - h / 2
+        x2 = x + w / 2
+        y2 = y + h / 2
+
+        return torch.stack([x1, y1, x2, y2], dim=-1)
+
+    # -----------------------------
+    # (2) IoU 계산
+    # -----------------------------
     def compute_iou(self, box1, box2, index):
-        box1 = torch.clone(box1)
-        box2 = torch.clone(box2)
-        box1 = self.conver_box(box1, index)
-        box2 = self.conver_box(box2, index)
-        x1, y1, w1, h1 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
-        x2, y2, w2, h2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
-        # 
-        inter_w = (w1 + w2) - (torch.max(x1 + w1, x2 + w2) - torch.min(x1, x2))
-        inter_h = (h1 + h2) - (torch.max(y1 + h1, y2 + h2) - torch.min(y1, y2))
-        inter_h = torch.clamp(inter_h, 0)
-        inter_w = torch.clamp(inter_w, 0)
-        # 
-        inter = inter_w * inter_h
-        union = w1 * h1 + w2 * h2 - inter
+        # xywh → xyxy
+        b1 = self.xywh_to_xyxy(box1, index)
+        b2 = self.xywh_to_xyxy(box2, index)
+
+        x1 = torch.max(b1[:, 0], b2[:, 0])
+        y1 = torch.max(b1[:, 1], b2[:, 1])
+        x2 = torch.min(b1[:, 2], b2[:, 2])
+        y2 = torch.min(b1[:, 3], b2[:, 3])
+
+        inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+
+        area1 = (b1[:, 2] - b1[:, 0]) * (b1[:, 3] - b1[:, 1])
+        area2 = (b2[:, 2] - b2[:, 0]) * (b2[:, 3] - b2[:, 1])
+
+        union = area1 + area2 - inter + 1e-6
+
         return inter / union
 
-    def conver_box(self, box, index):
-        i, j = index
-        box[:, 0], box[:, 1] = [(box[:, 0] + i) * self.step - box[:, 2] / 2,
-                                (box[:, 1] + j) * self.step - box[:, 3] / 2]
-        box = torch.clamp(box, 0)
-        return box
+    # -----------------------------
+    # (3) CIoU 계산
+    # -----------------------------
+    def Ciou_loss(self, box1, box2, index):
+        """
+        box1, box2: (N,4) xywh
+        """
+        # xywh → xyxy
+        b1 = self.xywh_to_xyxy(box1, index)
+        b2 = self.xywh_to_xyxy(box2, index)
 
+        # IoU
+        x1 = torch.max(b1[:, 0], b2[:, 0])
+        y1 = torch.max(b1[:, 1], b2[:, 1])
+        x2 = torch.min(b1[:, 2], b2[:, 2])
+        y2 = torch.min(b1[:, 3], b2[:, 3])
+        inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+        area1 = (b1[:, 2] - b1[:, 0]) * (b1[:, 3] - b1[:, 1])
+        area2 = (b2[:, 2] - b2[:, 0]) * (b2[:, 3] - b2[:, 1])
+        union = area1 + area2 - inter + 1e-6
+        iou = inter / union
+
+        # 중심점 거리
+        cx1 = (b1[:, 0] + b1[:, 2]) / 2
+        cy1 = (b1[:, 1] + b1[:, 3]) / 2
+        cx2 = (b2[:, 0] + b2[:, 2]) / 2
+        cy2 = (b2[:, 1] + b2[:, 3]) / 2
+        center_dist = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2
+
+        # 외접 박스 diag 길이
+        x_c1 = torch.min(b1[:, 0], b2[:, 0])
+        y_c1 = torch.min(b1[:, 1], b2[:, 1])
+        x_c2 = torch.max(b1[:, 2], b2[:, 2])
+        y_c2 = torch.max(b1[:, 3], b2[:, 3])
+        outer_diag = (x_c2 - x_c1) ** 2 + (y_c2 - y_c1) ** 2 + 1e-6
+
+        # 종횡비 일관성 v, α
+        w1 = b1[:, 2] - b1[:, 0]
+        h1 = b1[:, 3] - b1[:, 1]
+        w2 = b2[:, 2] - b2[:, 0]
+        h2 = b2[:, 3] - b2[:, 1]
+        v = (4 / (torch.pi ** 2)) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)) ** 2
+        alpha = v / (1 - iou + v + 1e-6)
+
+        ciou = iou - center_dist / outer_diag - alpha * v
+
+        # Loss = 1 - CIoU
+        return 1 - ciou
+
+    # -----------------------------
+    # (4) forward
+    # -----------------------------
     def forward(self, pred, target):
         batch_size = pred.size(0)
-        #target tensor = [batch_size,14,14,30]
-        #pred tensor = [batch_size,14,14,30]       
-        
-        #target matirx tensor로부터 bbox 정보만 분리, [batch_size,14,14,10]
-        #분리된 bbox tensor=[batch_size,14,14,10] --> [batch_size,14,14,2,5]로 변경
-        #이후 예측 tensor에 관해 동일 반복
-        target_boxes = target[:, :, :, :10].contiguous().reshape(
+
+        # bbox (10) → (B,S,S,2,5)
+        target_boxes = target[:, :, :, :10].reshape(
             (-1, self.S, self.S, 2, 5))
-        pred_boxes = pred[:, :, :, :10].contiguous().reshape(
+        pred_boxes = pred[:, :, :, :10].reshape(
             (-1, self.S, self.S, 2, 5))
-        
-        #target matirx tensor로부터 grid cell의 class probability 분리, [batch_size,14,14,20]
-        #예측 tensor에 관해 동일 반복
+
         target_cls = target[:, :, :, 10:]
         pred_cls = pred[:, :, :, 10:]
-        
-        #target tensor로부터 object가 위치하는 batch image 위치와 
-        # grid cell에서 좌표를 계산
-        #여기서, Obj_mask는 target tensor로부터 물체가 위치하는 
-        # grid cell 위치에 true값을 갖는 mask tensor임
-        #index tensor는 물체가 위치하는 batch image 위치와 grid cell에서
-        # 좌표값의 index를 갖음
-        obj_mask = (target_boxes[..., 4] > 0).byte()  #obj_mask=[-1,14,14,2]
-        sig_mask = obj_mask[..., 1].bool() #sig_mask=[-1,14,14]
-        index = torch.where(sig_mask == True) #
-        #object가 위치하는 grid cell마다 2개 bbox와 ground truth bbox(이하 GT)와
-        # IOU값을 계산하고 예측된 2 bbox중 IOU가 최대인 bbox를 찾아 GT bbox를 예측한 
-        # bbox로 선정함.
-        # 그리고 obj_mask에 나머지 bbox의 confidence score 위치에 0으로 reset함
+
+        # object mask
+        obj_mask = (target_boxes[..., 4] > 0).bool()   # (B,S,S,2)
+        sig_mask = obj_mask[..., 1]                   # (B,S,S)
+
+        index = torch.where(sig_mask == True)
+
+        # -------------------------
+        # BBOX 책임 할당 (highest IoU)
+        # -------------------------
         for img_i, y, x in zip(*index):
             img_i, y, x = img_i.item(), y.item(), x.item()
             pbox = pred_boxes[img_i, y, x]
-            target_box = target_boxes[img_i, y, x]
-            ious = self.compute_iou(pbox[:, :4], target_box[:, :4], [x, y])
-            iou, max_i = ious.max(0)
-            #pred_boxes[img_i, y, x, max_i, 4] = iou.item()
-            #pred_boxes[img_i, y, x, 1 - max_i, 4] = 0
-            obj_mask[img_i, y, x, 1 - max_i] = 0
-        
-        #obj_mask를 반전시켜 물체가 위치하지 않은 mask tensor를 구성
-        noobj_mask = ~obj_mask
-         
-        #물체가 존재하지 않은 bbox의 confidence score 오차의 loss값 계산 
-        noobj_loss = F.mse_loss(pred_boxes[noobj_mask][:, 4],
-                                target_boxes[noobj_mask][:, 4],
-                                reduction="sum")
-        #물체가 존재하는 bbox의 confidence score 오차의 loss값 계산
-        obj_loss = F.mse_loss(pred_boxes[obj_mask][:, 4],
-                              target_boxes[obj_mask][:, 4],
-                              reduction="sum")
-        #물체가 존재하는 bbox의 중심점의 오차에 loss값 계산
-        xy_loss = F.mse_loss(pred_boxes[obj_mask][:, :2],
-                             target_boxes[obj_mask][:, :2],
-                             reduction="sum")
-        
-        #물체가 존재하는 bbox의 width와 height의 오차에 loss값 계산
-        wh_loss = F.mse_loss(torch.sqrt(target_boxes[obj_mask][:, 2:4]),
-                             torch.sqrt(pred_boxes[obj_mask][:, 2:4]),
-                             reduction="sum")
-        
-        #물체가 존재하는 grid cell의 class probability의 오차에 loss값 계산
-        class_loss = F.mse_loss(pred_cls[sig_mask],
-                                target_cls[sig_mask],
-                                reduction="sum")
+            tbox = target_boxes[img_i, y, x]
+            ious = self.compute_iou(pbox[:, :4], tbox[:, :4], [x, y])
+            _, max_i = ious.max(0)
+            obj_mask[img_i, y, x, 1 - max_i] = False
 
-        #각 loss값의 합산
-        loss = obj_loss + self.lambda_noobj * noobj_loss \
-                    + self.lambda_coord * xy_loss + self.lambda_coord * wh_loss \
-                    + class_loss
-        
-        return loss/batch_size
+        noobj_mask = ~obj_mask
+
+        # -------------------------
+        # (A) confidence loss (L2)
+        # -------------------------
+        noobj_loss = F.mse_loss(
+            pred_boxes[noobj_mask][:, 4],
+            target_boxes[noobj_mask][:, 4],
+            reduction="sum"
+        )
+        obj_loss = F.mse_loss(
+            pred_boxes[obj_mask][:, 4],
+            target_boxes[obj_mask][:, 4],
+            reduction="sum"
+        )
+
+        # -------------------------
+        # (B) bbox CIoU regression
+        # -------------------------
+        bbox_loss = 0
+        for img_i, y, x in zip(*index):
+            p = pred_boxes[img_i, y, x][obj_mask[img_i, y, x]]
+            t = target_boxes[img_i, y, x][obj_mask[img_i, y, x]]
+            bbox_loss += self.Ciou_loss(p[:, :4], t[:, :4], [x, y]).sum()
+
+        # -------------------------
+        # (C) class loss (BCE)
+        # -------------------------
+        class_loss = F.binary_cross_entropy(
+            pred_cls[sig_mask],
+            target_cls[sig_mask],
+            reduction="sum"
+        )
+
+        # total
+        loss = (obj_loss
+                + self.lambda_noobj * noobj_loss
+                + self.lambda_coord * bbox_loss
+                + class_loss)
+
+        return loss / batch_size
