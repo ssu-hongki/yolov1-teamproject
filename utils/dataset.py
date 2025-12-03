@@ -53,7 +53,6 @@ class Dataset(data.Dataset):
         return img, boxes, labels
 
     def mosaic_augmentation(self, index):
-        """ 4장의 이미지를 모자이크로 합성 """
         indices = [index] + [random.randint(0, self.num_samples - 1) for _ in range(3)]
         imgs, bboxes, blabels = [], [], []
 
@@ -63,57 +62,96 @@ class Dataset(data.Dataset):
             bboxes.append(box)
             blabels.append(label)
 
+        # final mosaic canvas (2×size → 896×896)
         final_img = np.full((self.image_size * 2, self.image_size * 2, 3), 128, dtype=np.uint8)
-        final_boxes = []
-        final_labels = []
 
-        # 분할 위치
+        # random mosaic split point
         xc = random.randint(int(self.image_size * 0.5), int(self.image_size * 1.5))
         yc = random.randint(int(self.image_size * 0.5), int(self.image_size * 1.5))
 
-        positions = [
+        # 4 mosaic areas
+        areas = [
             (0, 0, xc, yc),                                        # top-left
             (xc, 0, self.image_size * 2, yc),                      # top-right
             (0, yc, xc, self.image_size * 2),                      # bottom-left
             (xc, yc, self.image_size * 2, self.image_size * 2)     # bottom-right
         ]
 
+        new_boxes = []
+        new_labels = []
+
         for i, (img, box, label) in enumerate(zip(imgs, bboxes, blabels)):
-            h, w, _ = img.shape
-            # resize
-            img_resized = cv2.resize(img, (self.image_size, self.image_size))
-            b_scale = torch.tensor([w, h, w, h]).float()
-            box = box / b_scale
-            box = box * self.image_size  # 다시 pixel 좌표로
+            ih, iw = img.shape[:2]
+            x1, y1, x2, y2 = areas[i]
 
-            # mosaic 영역
-            x1, y1, x2, y2 = positions[i]
+            # target mosaic region size
+            target_w = x2 - x1
+            target_h = y2 - y1
 
-            # 넣을 이미지 좌표
-            img_x1 = x1
-            img_y1 = y1
-            img_x2 = x1 + self.image_size
-            img_y2 = y1 + self.image_size
+            # --------------------------------------------------------
+            # 1) Random crop from original image
+            # --------------------------------------------------------
+            scale_w = random.uniform(0.5, 1.0)
+            scale_h = random.uniform(0.5, 1.0)
 
-            final_img[img_y1:img_y2, img_x1:img_x2] = img_resized
+            crop_w = int(iw * scale_w)
+            crop_h = int(ih * scale_h)
 
-            # box 이동
-            shift = torch.tensor([img_x1, img_y1, img_x1, img_y1])
-            moved_box = box + shift
+            cx = random.randint(0, max(0, iw - crop_w))
+            cy = random.randint(0, max(0, ih - crop_h))
 
-            final_boxes.append(moved_box)
-            final_labels.append(label)
+            crop = img[cy:cy+crop_h, cx:cx+crop_w]
 
-        final_boxes = torch.cat(final_boxes, dim=0)
-        final_labels = torch.cat(final_labels, dim=0)
+            # bbox crop
+            box_pix = box.clone()
+            box_pix[:, [0,2]] = box_pix[:, [0,2]] * iw
+            box_pix[:, [1,3]] = box_pix[:, [1,3]] * ih
 
-        # 2배 크기 → 448×448로 리사이즈
+            # cropping 적용
+            box_pix[:, [0,2]] -= cx
+            box_pix[:, [1,3]] -= cy
+
+            # clip
+            box_pix[:, 0] = box_pix[:, 0].clamp(0, crop_w)
+            box_pix[:, 1] = box_pix[:, 1].clamp(0, crop_h)
+            box_pix[:, 2] = box_pix[:, 2].clamp(0, crop_w)
+            box_pix[:, 3] = box_pix[:, 3].clamp(0, crop_h)
+
+            # 제거된 박스 필터링
+            keep = (box_pix[:, 2] - box_pix[:, 0] > 5) & (box_pix[:, 3] - box_pix[:, 1] > 5)
+            box_pix = box_pix[keep]
+            label = label[keep]
+
+            # --------------------------------------------------------
+            # 2) Resize crop → mosaic area 크기(target_w, target_h)
+            # --------------------------------------------------------
+            crop = cv2.resize(crop, (target_w, target_h))
+            scale_x = target_w / crop_w
+            scale_y = target_h / crop_h
+            box_pix[:, [0,2]] *= scale_x
+            box_pix[:, [1,3]] *= scale_y
+
+            # --------------------------------------------------------
+            # 3) Paste into mosaic canvas
+            # --------------------------------------------------------
+            final_img[y1:y2, x1:x2] = crop
+
+            box_pix[:, [0,2]] += x1
+            box_pix[:, [1,3]] += y1
+
+            new_boxes.append(box_pix)
+            new_labels.append(label)
+
+        new_boxes = torch.cat(new_boxes, dim=0)
+        new_labels = torch.cat(new_labels, dim=0)
+
+        # --------------------------------------------------------
+        # 4) Final resize → 448×448
+        # --------------------------------------------------------
         final_img = cv2.resize(final_img, (self.image_size, self.image_size))
-        scale = 2.0
-        final_boxes /= scale
+        new_boxes /= 2.0   # (896 → 448)
 
-        return final_img, final_boxes, final_labels
-
+        return final_img, new_boxes, new_labels
     # ------------------------------------------------------
     #      Dataset __getitem__
     # ------------------------------------------------------
