@@ -38,61 +38,68 @@ COLORS = {'aeroplane': (0, 0, 0),
           'train': (0, 192, 0),
           'tvmonitor': (128, 192, 0)}
 
-
 def decoder(prediction):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     grid_num = 14
+    cell_size = 1. / grid_num
+
+    prediction = prediction.data.squeeze()  # (14,14,30)
+
+    contain = torch.stack([
+        prediction[:,:,4], 
+        prediction[:,:,9]
+    ], dim=2)  # (14,14,2)
+
+    # confidence threshold
+    mask1 = contain > 0.1 
+
+    # per-cell local max
+    max_idx = torch.argmax(contain, dim=2, keepdim=True)
+    mask2 = torch.zeros_like(contain, dtype=torch.bool)
+    mask2.scatter_(2, max_idx, True)
+
+    mask = (mask1 & mask2)
+
     boxes = []
     cls_indexes = []
     confidences = []
-    cell_size = 1. / grid_num
-    #각 image의 output tensor를 batch 축을 제거하고 [14,14,30] tensor로 변환
-    # output tensor [14,14,30]로부 부터 bbox의 confidence score를 포함하는
-    # tensor의 5번째와 10번재 plane 축 분리, 각각 [14,14] 크기를 갖는 tensor임
-    # 두 tensor의 마지막 축을 하나 더 만들, [14,14,1]
-    # 이 축을 중심으로 두 tensor들을 concatenation함, contain=[14,14,2]
-    prediction = prediction.data.squeeze()  # 14x14x30
-    contain1 = prediction[:, :, 4].unsqueeze(2)
-    contain2 = prediction[:, :, 9].unsqueeze(2)
-    contain = torch.cat((contain1, contain2), 2)
-    # contain의 값이 0.1를 갖는 성분들은 true값을 갖고 그렇지 않은 성분을 false로 set함
-    mask1 = contain > 0.1
-    # contain의 각 grid cell별로 confidence score의 max 값과 같은 bbox 위치에 mask2에
-    # true값을 set함 그렇지 않은 bbox 위치에 false값을 set함
-    mask2 = (contain == contain.max())
-    #mask1과 mask2의 성분별 덧셈을 수행하고 0보다 큰 성분에 대해 mask에 true, 
-    #그렇지 않은 mask위치에 false값을 설정
-    mask = (mask1 + mask2).gt(0)
+
     for i in range(grid_num):
         for j in range(grid_num):
             for b in range(2):
-                if mask[i, j, b] == 1:
-                    #mask tensor에서 grid cell의 bbox에서 값이 true인 경우에 다음 수행
-                    #예측 output tensor로부터 bbox를 시작점과 끝점을 갖는 bbox로 변환
-                    box = prediction[i, j, b * 5:b * 5 + 4]
-                    contain_prob = torch.FloatTensor([prediction[i, j,b * 5 + 4]]).to(device)
-                    xy = torch.FloatTensor([j, i]) * cell_size
-                    box[:2] = box[:2] * cell_size + xy.to(device)
-                    box_xy = torch.FloatTensor(box.size())
-                    box_xy[:2] = box[:2] - 0.5 * box[2:]
-                    box_xy[2:] = box[:2] + 0.5 * box[2:]
-                    #bbox의 분류값과 confidence score 계산
-                    max_prob, cls_index = torch.max(prediction[i, j, 10:], 0)
-                    if float((contain_prob * max_prob)[0]) > 0.1:
-                        boxes.append(box_xy.view(1, 4))
-                        cls_indexes.append(cls_index)
-                        confidences.append(contain_prob * max_prob)
-    if len(boxes) == 0:
-        boxes = torch.zeros((1, 4))
-        confidences = torch.zeros(1)
-        cls_indexes = torch.zeros(1)
-    else:
-        boxes = torch.cat(boxes, 0).to(device)  # (n,4)
-        confidences = torch.cat(confidences, 0)  # (n,)
-        cls_indexes = [item.unsqueeze(0) for item in cls_indexes]
-        cls_indexes = torch.cat(cls_indexes, 0)  # (n,)
-    #bbox정보와 confidence정보를 이용하여 NMS 알고리즘을 수행하여 중복된 bbox제거    
-    keep = nms(boxes, confidences, threshold=0.5)
+                if mask[i,j,b]:
+                    # cx, cy, w, h
+                    cx = (prediction[i,j,b*5] + j) * cell_size
+                    cy = (prediction[i,j,b*5+1] + i) * cell_size
+                    w  = prediction[i,j,b*5+2]
+                    h  = prediction[i,j,b*5+3]
+
+                    x1 = cx - w/2
+                    y1 = cy - h/2
+                    x2 = cx + w/2
+                    y2 = cy + h/2
+
+                    box = torch.tensor([x1,y1,x2,y2]).to(device)
+
+                    # class score
+                    max_prob, cls_index = torch.max(prediction[i,j,10:], 0)
+                    conf = prediction[i,j,b*5+4] * max_prob
+
+                    if conf > 0.1:
+                        boxes.append(box.unsqueeze(0))
+                        cls_indexes.append(cls_index.unsqueeze(0))
+                        confidences.append(conf.unsqueeze(0))
+
+    if len(boxes)==0:
+        return torch.zeros((1,4)), torch.zeros(1), torch.zeros(1)
+
+    boxes = torch.cat(boxes).to(device)
+    confidences = torch.cat(confidences).to(device)
+    cls_indexes = torch.cat(cls_indexes).to(device)
+
+    # NMS
+    keep = nms(boxes, confidences, threshold=0.45)
+
     return boxes[keep], cls_indexes[keep], confidences[keep]
 
 
