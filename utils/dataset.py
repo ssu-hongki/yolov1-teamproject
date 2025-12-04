@@ -15,7 +15,7 @@ class Dataset(data.Dataset):
 
     def __init__(self, root, file_names, train, transform):
         print('DATA INITIALIZATION')
-
+        
         self.root_images = os.path.join(root, 'Images')
         self.root_labels = os.path.join(root, 'Labels')
         self.train = train
@@ -32,167 +32,42 @@ class Dataset(data.Dataset):
                 self.f_names.append(line + '.jpg')
                 box = []
                 label = []
-                for obj in objects:
-                    c, x1, y1, x2, y2 = map(float, obj.rstrip().split())
+                for object in objects:
+                    c, x1, y1, x2, y2 = map(float, object.rstrip().split())
                     box.append([x1, y1, x2, y2])
                     label.append(int(c) + 1)
                 self.boxes.append(torch.Tensor(box))
                 self.labels.append(torch.LongTensor(label))
-
         self.num_samples = len(self.boxes)
 
-    # ------------------------------------------------------
-    #                    Mosaic Augmentation
-    # ------------------------------------------------------
-    def load_image_and_label(self, index):
-        """ 기본 이미지 + box 로딩 """
-        f_name = self.f_names[index]
-        img = cv2.imread(os.path.join(self.root_images, f_name))
-        boxes = self.boxes[index].clone()
-        labels = self.labels[index].clone()
-        return img, boxes, labels
-
-    def mosaic_augmentation(self, index):
-        indices = [index] + [random.randint(0, self.num_samples - 1) for _ in range(3)]
-        imgs, bboxes, blabels = [], [], []
-
-        for idx in indices:
-            img, box, label = self.load_image_and_label(idx)
-            imgs.append(img)
-            bboxes.append(box)
-            blabels.append(label)
-
-        # final mosaic canvas (2×size → 896×896)
-        final_img = np.full((self.image_size * 2, self.image_size * 2, 3), 128, dtype=np.uint8)
-
-        # random mosaic split point
-        xc = random.randint(int(self.image_size * 0.5), int(self.image_size * 1.5))
-        yc = random.randint(int(self.image_size * 0.5), int(self.image_size * 1.5))
-
-        # 4 mosaic areas
-        areas = [
-            (0, 0, xc, yc),                                        # top-left
-            (xc, 0, self.image_size * 2, yc),                      # top-right
-            (0, yc, xc, self.image_size * 2),                      # bottom-left
-            (xc, yc, self.image_size * 2, self.image_size * 2)     # bottom-right
-        ]
-
-        new_boxes = []
-        new_labels = []
-
-        for i, (img, box, label) in enumerate(zip(imgs, bboxes, blabels)):
-            ih, iw = img.shape[:2]
-            x1, y1, x2, y2 = areas[i]
-
-            # target mosaic region size
-            target_w = x2 - x1
-            target_h = y2 - y1
-
-            # --------------------------------------------------------
-            # 1) Random crop from original image
-            # --------------------------------------------------------
-            scale_w = random.uniform(0.5, 1.0)
-            scale_h = random.uniform(0.5, 1.0)
-
-            crop_w = int(iw * scale_w)
-            crop_h = int(ih * scale_h)
-
-            cx = random.randint(0, max(0, iw - crop_w))
-            cy = random.randint(0, max(0, ih - crop_h))
-
-            crop = img[cy:cy+crop_h, cx:cx+crop_w]
-
-            # bbox crop
-            box_pix = box.clone()
-            box_pix[:, [0,2]] = box_pix[:, [0,2]] * iw
-            box_pix[:, [1,3]] = box_pix[:, [1,3]] * ih
-
-            # cropping 적용
-            box_pix[:, [0,2]] -= cx
-            box_pix[:, [1,3]] -= cy
-
-            # clip
-            box_pix[:, 0] = box_pix[:, 0].clamp(0, crop_w)
-            box_pix[:, 1] = box_pix[:, 1].clamp(0, crop_h)
-            box_pix[:, 2] = box_pix[:, 2].clamp(0, crop_w)
-            box_pix[:, 3] = box_pix[:, 3].clamp(0, crop_h)
-
-            # 제거된 박스 필터링
-            keep = (box_pix[:, 2] - box_pix[:, 0] > 5) & (box_pix[:, 3] - box_pix[:, 1] > 5)
-            box_pix = box_pix[keep]
-            label = label[keep]
-
-            # --------------------------------------------------------
-            # 2) Resize crop → mosaic area 크기(target_w, target_h)
-            # --------------------------------------------------------
-            crop = cv2.resize(crop, (target_w, target_h))
-            scale_x = target_w / crop_w
-            scale_y = target_h / crop_h
-            box_pix[:, [0,2]] *= scale_x
-            box_pix[:, [1,3]] *= scale_y
-
-            # --------------------------------------------------------
-            # 3) Paste into mosaic canvas
-            # --------------------------------------------------------
-            final_img[y1:y2, x1:x2] = crop
-
-            box_pix[:, [0,2]] += x1
-            box_pix[:, [1,3]] += y1
-
-            new_boxes.append(box_pix)
-            new_labels.append(label)
-
-        new_boxes = torch.cat(new_boxes, dim=0)
-        new_labels = torch.cat(new_labels, dim=0)
-
-        # --------------------------------------------------------
-        # 4) Final resize → 448×448
-        # --------------------------------------------------------
-        final_img = cv2.resize(final_img, (self.image_size, self.image_size))
-        new_boxes /= 2.0   # (896 → 448)
-
-        return final_img, new_boxes, new_labels
-    # ------------------------------------------------------
-    #      Dataset __getitem__
-    # ------------------------------------------------------
     def __getitem__(self, idx):
+        f_name = self.f_names[idx]
+        img = cv2.imread(os.path.join(self.root_images, f_name))
+        boxes = self.boxes[idx].clone()
+        labels = self.labels[idx].clone()
 
-        # --------------------------------------------------
-        # Mosaic 사용 (p=0.5 정도)
-        # --------------------------------------------------
-        if self.train and random.random() < 0.5:
-            img, boxes, labels = self.mosaic_augmentation(idx)
-        else:
-            img, boxes, labels = self.load_image_and_label(idx)
-
-            # 기존 증강
-            if self.train:
-                img, boxes = self.random_flip(img, boxes)
-                img, boxes = self.randomScale(img, boxes)
-                img = self.randomBlur(img)
-                img = self.RandomBrightness(img)
-                img = self.RandomHue(img)
-                img = self.RandomSaturation(img)
-                img, boxes, labels = self.randomShift(img, boxes, labels)
-                img, boxes, labels = self.randomCrop(img, boxes, labels)
-
+        if self.train:
+            # img = self.random_bright(img)
+            img, boxes = self.random_flip(img, boxes)
+            img, boxes = self.randomScale(img, boxes)
+            img = self.randomBlur(img)
+            img = self.RandomBrightness(img)
+            img = self.RandomHue(img)
+            img = self.RandomSaturation(img)
+            img, boxes, labels = self.randomShift(img, boxes, labels)
+            img, boxes, labels = self.randomCrop(img, boxes, labels)
+        
         h, w, _ = img.shape
-        boxes /= torch.tensor([w, h, w, h]).expand_as(boxes)
-
+        boxes /= torch.Tensor([w, h, w, h]).expand_as(boxes)
         img = self.BGR2RGB(img)
         img = self.subMean(img, self.mean)
         img = cv2.resize(img, (self.image_size, self.image_size))
-
-        target = self.encoder(boxes, labels)
-
+        target = self.encoder(boxes, labels)  # 14x14x30
         for t in self.transform:
             img = t(img)
 
         return img, target
 
-    # ------------------------------------------------------
-    # 그대로 두는 부분들 (encoder + augmentation)
-    # ------------------------------------------------------
     def __len__(self):
         return self.num_samples
 
@@ -202,25 +77,26 @@ class Dataset(data.Dataset):
         cell_size = 1. / grid_num
         wh = boxes[:, 2:] - boxes[:, :2]
         cxcy = (boxes[:, 2:] + boxes[:, :2]) / 2
-
         for i in range(cxcy.size()[0]):
             cxcy_sample = cxcy[i]
+            #grid cell의 Y축과 X축의 index 계산
             ij = (cxcy_sample / cell_size).ceil() - 1
+            #grid cell의 2개 bbox의  confidence score을 1로 set
             target[int(ij[1]), int(ij[0]), 4] = 1
             target[int(ij[1]), int(ij[0]), 9] = 1
+            #grid cell의 class probability을 1로 set
             target[int(ij[1]), int(ij[0]), int(labels[i]) + 9] = 1
-
+            #bbox의 중심점 (cx,cy)를 (i,j) grid cell의 원점으로 부터
+            # offset값으로 (delta_x, delta_y) 계산하고 target 행렬 tensor의 
+            # (i,j) grid cell 위치에 정규화한 bbox정보를 저장
             xy = ij * cell_size
             delta_xy = (cxcy_sample - xy) / cell_size
-
             target[int(ij[1]), int(ij[0]), 2:4] = wh[i]
             target[int(ij[1]), int(ij[0]), :2] = delta_xy
             target[int(ij[1]), int(ij[0]), 7:9] = wh[i]
             target[int(ij[1]), int(ij[0]), 5:7] = delta_xy
-
         return target
 
-    # --------------------- utility augmentations ------------------------
     def BGR2RGB(self, img):
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
@@ -272,64 +148,57 @@ class Dataset(data.Dataset):
         center = (boxes[:, 2:] + boxes[:, :2]) / 2
         if random.random() < 0.5:
             height, width, c = bgr.shape
-            after = np.zeros((height, width, c), dtype=bgr.dtype)
-            after[:, :, :] = (104, 117, 123)
-
+            after_shfit_image = np.zeros((height, width, c), dtype=bgr.dtype)
+            after_shfit_image[:, :, :] = (104, 117, 123)  # bgr
             shift_x = random.uniform(-width * 0.2, width * 0.2)
             shift_y = random.uniform(-height * 0.2, height * 0.2)
 
-            x_shift = int(shift_x)
-            y_shift = int(shift_y)
-
-            # image shift
             if shift_x >= 0 and shift_y >= 0:
-                after[y_shift:, x_shift:, :] = bgr[:height - y_shift, :width - x_shift]
+                after_shfit_image[int(shift_y):, int(shift_x):, :] = bgr[:height - int(shift_y), :width - int(shift_x),
+                                                                     :]
             elif shift_x >= 0 and shift_y < 0:
-                after[:height + y_shift, x_shift:, :] = bgr[-y_shift:, :width - x_shift]
+                after_shfit_image[:height + int(shift_y), int(shift_x):, :] = bgr[-int(shift_y):, :width - int(shift_x),
+                                                                              :]
             elif shift_x < 0 and shift_y >= 0:
-                after[y_shift:, :width + x_shift, :] = bgr[:height - y_shift, -x_shift:]
-            else:
-                after[:height + y_shift, :width + x_shift, :] = bgr[-y_shift:, -x_shift:]
+                after_shfit_image[int(shift_y):, :width + int(shift_x), :] = bgr[:height - int(shift_y), -int(shift_x):,
+                                                                             :]
+            elif shift_x < 0 and shift_y < 0:
+                after_shfit_image[:height + int(shift_y), :width + int(shift_x), :] = bgr[-int(shift_y):,
+                                                                                      -int(shift_x):, :]
 
-            shift_xy = torch.FloatTensor([[x_shift, y_shift]]).expand_as(center)
+            shift_xy = torch.FloatTensor([[int(shift_x), int(shift_y)]]).expand_as(center)
             center = center + shift_xy
-
             mask1 = (center[:, 0] > 0) & (center[:, 0] < width)
             mask2 = (center[:, 1] > 0) & (center[:, 1] < height)
             mask = (mask1 & mask2).view(-1, 1)
-
             boxes_in = boxes[mask.expand_as(boxes)].view(-1, 4)
             if len(boxes_in) == 0:
                 return bgr, boxes, labels
-
-            box_shift = torch.FloatTensor([[x_shift, y_shift, x_shift, y_shift]]).expand_as(boxes_in)
+            box_shift = torch.FloatTensor([[int(shift_x), int(shift_y), int(shift_x), int(shift_y)]]).expand_as(
+                boxes_in)
             boxes_in = boxes_in + box_shift
             labels_in = labels[mask.view(-1)]
-
-            return after, boxes_in, labels_in
-
+            return after_shfit_image, boxes_in, labels_in
         return bgr, boxes, labels
 
     def randomScale(self, bgr, boxes):
         if random.random() < 0.5:
             scale = random.uniform(0.8, 1.2)
             height, width, c = bgr.shape
-            bgr_resized = cv2.resize(bgr, (int(width * scale), height))
+            bgr = cv2.resize(bgr, (int(width * scale), height))
             scale_tensor = torch.FloatTensor([[scale, 1, scale, 1]]).expand_as(boxes)
             boxes = boxes * scale_tensor
-            return bgr_resized, boxes
+            return bgr, boxes
         return bgr, boxes
 
     def randomCrop(self, bgr, boxes, labels):
         if random.random() < 0.5:
             center = (boxes[:, 2:] + boxes[:, :2]) / 2
             height, width, c = bgr.shape
-
             h = random.uniform(0.6 * height, height)
             w = random.uniform(0.6 * width, width)
             x = random.uniform(0, width - w)
             y = random.uniform(0, height - h)
-
             x, y, h, w = int(x), int(y), int(h), int(w)
 
             center = center - torch.FloatTensor([[x, y]]).expand_as(center)
@@ -338,28 +207,25 @@ class Dataset(data.Dataset):
             mask = (mask1 & mask2).view(-1, 1)
 
             boxes_in = boxes[mask.expand_as(boxes)].view(-1, 4)
-
             if len(boxes_in) == 0:
                 return bgr, boxes, labels
-
             box_shift = torch.FloatTensor([[x, y, x, y]]).expand_as(boxes_in)
+
             boxes_in = boxes_in - box_shift
+            boxes_in[:, 0] = boxes_in[:, 0].clamp_(min=0, max=w)
+            boxes_in[:, 2] = boxes_in[:, 2].clamp_(min=0, max=w)
+            boxes_in[:, 1] = boxes_in[:, 1].clamp_(min=0, max=h)
+            boxes_in[:, 3] = boxes_in[:, 3].clamp_(min=0, max=h)
 
-            boxes_in[:, 0] = boxes_in[:, 0].clamp(0, w)
-            boxes_in[:, 2] = boxes_in[:, 2].clamp(0, w)
-            boxes_in[:, 1] = boxes_in[:, 1].clamp(0, h)
-            boxes_in[:, 3] = boxes_in[:, 3].clamp(0, h)
-
-            img_crop = bgr[y:y + h, x:x + w]
             labels_in = labels[mask.view(-1)]
-
-            return img_crop, boxes_in, labels_in
-
+            img_croped = bgr[y:y + h, x:x + w, :]
+            return img_croped, boxes_in, labels_in
         return bgr, boxes, labels
 
     def subMean(self, bgr, mean):
         mean = np.array(mean, dtype=np.float32)
-        return bgr - mean
+        bgr = bgr - mean
+        return bgr
 
     def random_flip(self, im, boxes):
         if random.random() < 0.5:
@@ -376,5 +242,24 @@ class Dataset(data.Dataset):
         alpha = random.random()
         if alpha > 0.3:
             im = im * alpha + random.randrange(-delta, delta)
-            im = np.clip(im, 0, 255).astype(np.uint8)
+            im = im.clip(min=0, max=255).astype(np.uint8)
         return im
+
+
+def main():
+    from torch.utils.data import DataLoader
+    import torchvision.transforms as transforms
+    file_root = './Dataset'
+    with open('./Dataset/train.txt') as f:
+        train_names = f.readlines()
+    train_dataset = Dataset(root=file_root, file_names=train_names, train=True,
+                            transform=[transforms.ToTensor()])
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False, num_workers=os.cpu_count() - 2)
+    train_iter = iter(train_loader)
+    for i in range(10):
+        img, target = next(train_iter)
+        print(img, target)
+
+
+if __name__ == '__main__':
+    main()
